@@ -1,0 +1,145 @@
+#!/bin/bash
+#
+# omarchy-plugin-browser — browse the Omarchy plugin marketplace from a
+# terminal, and audit anything before it touches your shell.
+#
+# Reads the public catalog at plugins.omarchy.org as plain data (names, authors,
+# tags, verification status, the install command the marketplace prints) and
+# never executes anything from it. Every install path routes through
+# `omarchy-plugin-audit`, which clones into a sandbox, pins to the verified
+# commit, and scans — so the browser hands you a reviewed checkout, not a
+# blind `omarchy plugin add`.
+#
+# Usage: omarchy-plugin-browser [--refresh] [--category <name>]
+set -uo pipefail
+
+CATALOG_URL="https://plugins.omarchy.org/catalog.json"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-plugin-audit"
+CATALOG="$CACHE_DIR/catalog.json"
+CACHE_TTL=3600
+SELF_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+AUDIT="$SELF_DIR/omarchy-plugin-audit"
+[[ -x $AUDIT ]] || AUDIT="omarchy-plugin-audit"
+
+FORCE=0; ONLY_CAT=""
+while (( $# )); do
+  case "$1" in
+    --refresh) FORCE=1; shift ;;
+    --category) ONLY_CAT="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+    *) echo "browser: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+for t in jq curl gum; do command -v "$t" >/dev/null || { echo "browser: missing required tool: $t" >&2; exit 3; }; done
+mkdir -p "$CACHE_DIR"
+
+fetch() {
+  if (( ! FORCE )) && [[ -f $CATALOG ]] \
+     && (( $(date +%s) - $(stat -c %Y "$CATALOG" 2>/dev/null || echo 0) < CACHE_TTL )); then return 0; fi
+  gum spin --spinner dot --title "Fetching the marketplace catalog…" -- \
+    curl -fsS --max-time 30 -o "$CATALOG.tmp" "$CATALOG_URL" \
+    && jq -e . "$CATALOG.tmp" >/dev/null 2>&1 && mv "$CATALOG.tmp" "$CATALOG" \
+    || { rm -f "$CATALOG.tmp"; [[ -f $CATALOG ]] || { echo "browser: could not fetch catalog and no cache present." >&2; exit 3; }; echo "browser: using stale cache." >&2; }
+}
+
+# Badge: ✔ verified snapshot & upstream matches · ◐ snapshot verified but upstream
+# moved (update unverified) · · unverified.
+badge_jq='
+  def badge:
+    if .verificationStatus=="verified" then "✔"
+    elif .verificationSnapshotStatus=="verified" then "◐"
+    else "·" end;'
+
+list_lines() {  # one selectable line per plugin; id is the final token
+  jq -r "$badge_jq"'
+    .plugins
+    | map(select(.sourceType=="community"))
+    | ( if $cat=="" then . else map(select(.category==$cat)) end )
+    | sort_by(-( .stars // 0 ))
+    | .[]
+    | [ badge, "  ",
+        (.name // .id),
+        "  —  ", (.author // "?"),
+        "   ", (.category // "?"),
+        "   ★", ((.stars // 0)|tostring),
+        (if (.tags|length)>0 then "   #" + (.tags|join(" #")) else "" end),
+        "   ", .id ] | join("")
+  ' --arg cat "$ONLY_CAT" "$CATALOG"
+}
+
+entry_by_id() { jq -c --arg id "$1" '.plugins[] | select(.id==$id)' "$CATALOG" | head -1; }
+
+show_detail() {  # $1 = id
+  local e; e=$(entry_by_id "$1"); [[ -n $e ]] || return
+  local name author repo cat stars vstat vcov vcommit upstream install avail note ver tags desc
+  name=$(jq -r '.name//.id' <<<"$e");      author=$(jq -r '.author//"?"' <<<"$e")
+  repo=$(jq -r '.repo//""' <<<"$e");       cat=$(jq -r '.category//"?"' <<<"$e")
+  stars=$(jq -r '.stars//0' <<<"$e");      ver=$(jq -r '.version//"?"' <<<"$e")
+  vstat=$(jq -r '.verificationStatus//"unverified"' <<<"$e")
+  vcov=$(jq -r '.verificationCoverage//"none"' <<<"$e")
+  vcommit=$(jq -r '.verificationCommit//.listingValidatedCommit//""' <<<"$e")
+  upstream=$(jq -r '.upstreamObservedCommit//""' <<<"$e")
+  install=$(jq -r '.installCommand//""' <<<"$e")
+  avail=$(jq -r '.installAvailable//false' <<<"$e")
+  note=$(jq -r '.installNote//""' <<<"$e")
+  desc=$(jq -r '.description//""' <<<"$e")
+  tags=$(jq -r 'if (.tags|length)>0 then "#"+(.tags|join("  #")) else "" end' <<<"$e")
+
+  local vline
+  case "$vstat/$vcov" in
+    verified/*)            vline="✔  verified snapshot, upstream matches" ;;
+    */update-unverified)   vline="◐  snapshot verified, but a NEWER upstream commit is unverified" ;;
+    *)                     vline="·  unverified (not a malware signal — just no automated check on record)" ;;
+  esac
+
+  gum style --border rounded --border-foreground 63 --padding "0 2" --margin "1 0" --width 76 \
+    "$(gum style --bold "$name")  $(gum style --faint "v$ver")" \
+    "$(gum style --faint "by $author   ·   $cat   ·   ★$stars")" \
+    "" \
+    "$(printf '%s' "$desc" | fold -s -w 72)" \
+    "" \
+    "$(gum style --faint "$tags")" \
+    "" \
+    "$vline" \
+    "$(gum style --faint "verified  ${vcommit:0:12}    upstream  ${upstream:0:12}")" \
+    "$(gum style --faint "repo  $repo")" \
+    "$( [[ $avail != true && -n $note ]] && printf '\n%s' "$(gum style --foreground 214 "$(printf '%s' "note: $note" | fold -s -w 72)")" )"
+
+  local actions=("🛡  Audit before install (sandboxed scan)")
+  [[ $avail == true && -n $install ]] && actions+=("📋  Copy install command")
+  [[ -n $repo ]] && actions+=("🌐  Open repo in browser")
+  actions+=("↩  Back")
+
+  local choice
+  choice=$(printf '%s\n' "${actions[@]}" | gum choose --header "  $name") || return
+  case "$choice" in
+    🛡*) run_audit "$1" ;;
+    📋*) printf '%s' "$install" | wl-copy 2>/dev/null && gum style --foreground 42 "  Copied:  $install" || echo "  $install"; gum input --placeholder "Enter to continue" >/dev/null 2>&1 || read -r _ ;;
+    🌐*) [[ $repo == https://github.com/* ]] && omarchy launch browser "$repo" >/dev/null 2>&1 & ;;
+    *) return ;;
+  esac
+}
+
+run_audit() {  # $1 = id, validated to the plugin-id charset before use
+  local id="$1"
+  [[ $id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { gum style --foreground 196 "  refusing suspicious id"; return; }
+  echo
+  "$AUDIT" "$id"          # runs in this same terminal; report stays on screen
+  echo
+  gum input --placeholder "Enter to return to the list" >/dev/null 2>&1 || read -r _
+}
+
+main() {
+  fetch
+  local total; total=$(jq '.plugins | map(select(.sourceType=="community")) | length' "$CATALOG")
+  while true; do
+    local line id
+    line=$(list_lines | gum filter --height 20 --prompt "🔎 " \
+      --placeholder "Search $total plugins by name, author, tag, category…  (Esc to quit)" \
+      --indicator "▸" --header "Omarchy plugin marketplace   ✔ verified   ◐ snapshot-verified, update pending   · unverified") || break
+    id="${line##* }"                 # id is the final whitespace-delimited token
+    [[ -n $id ]] && show_detail "$id"
+  done
+}
+main

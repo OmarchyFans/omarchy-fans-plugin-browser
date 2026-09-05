@@ -1,0 +1,418 @@
+#!/bin/bash
+#
+# omarchy-plugin-audit — inspect an Omarchy shell plugin before it touches your
+# desktop.
+#
+# Omarchy plugins run as unsandboxed code inside the long-lived omarchy-shell
+# process, with everything your user account can reach (see
+# `/usr/share/omarchy/shell/README.md`). `omarchy plugin add` clones the repo,
+# validates the manifest, and lands it DISABLED so you can read it first. This
+# tool does the reading for you: it clones into a throwaway directory, pins the
+# checkout to the marketplace's *verified* commit when there is one, greps the
+# tree for hostile patterns inside a locked-down bwrap sandbox, and only then —
+# if you pass --install — hands the vetted checkout to `omarchy plugin add`.
+#
+# It never enables a plugin, never edits your shell config, and never runs code
+# from the plugin. The sandbox has no network and an empty home.
+#
+# Usage:
+#   omarchy-plugin-audit <git-url | plugin-id | local-dir> [options]
+#
+#   <git-url>     https URL of a plugin repo (github.com/...).
+#   <plugin-id>   a marketplace id (e.g. crmne.hyprmoncfg); resolved via the
+#                 public catalog to its repo and verified commit.
+#   <local-dir>   an already-installed or local plugin folder to re-audit.
+#
+# Options:
+#   --head          Audit upstream HEAD instead of the verified commit.
+#   --commit <sha>  Audit an exact commit.
+#   --install       After a clean/reviewed audit, pin to the audited commit and
+#                   run `omarchy plugin add <dir> --yes` (installs DISABLED).
+#   --json          Emit a machine-readable JSON report instead of text.
+#   --no-sandbox    Scan without bwrap (only if bwrap is unavailable). Louder,
+#                   less safe; the scanner still never executes plugin code.
+#   --pause         Wait for a keypress before exiting (used when launched in a
+#                   terminal that would otherwise close).
+#   -h, --help      This help.
+#
+# Exit codes: 0 clean · 10 review-required · 20 findings · 2 usage · 3 scan error
+set -uo pipefail
+
+# --------------------------------------------------------------------------- ui
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'
+  BLU=$'\e[34m'; CYN=$'\e[36m'; RST=$'\e[0m'
+else BOLD=; DIM=; RED=; GRN=; YEL=; BLU=; CYN=; RST=; fi
+
+say()  { printf '%s\n' "$*"; }
+head2(){ printf '\n%s%s%s\n' "$BOLD" "$*" "$RST"; }
+die()  { printf '%saudit:%s %s\n' "$RED" "$RST" "$*" >&2; exit "${2:-2}"; }
+
+OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+OMARCHY_BIN="$OMARCHY_PATH/bin"
+SELF_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+SCANNER="$SELF_DIR/../lib/omarchy-plugin-scan.sh"
+[[ -f $SCANNER ]] || SCANNER="$SELF_DIR/omarchy-plugin-scan.sh"
+[[ -f $SCANNER ]] || die "scanner not found next to this script" 3
+
+CATALOG_URL="https://plugins.omarchy.org/catalog.json"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-plugin-audit"
+CACHE_TTL=3600
+
+# ------------------------------------------------------------------- arg parse
+TARGET=""; MODE_HEAD=0; PIN_COMMIT=""; DO_INSTALL=0; AS_JSON=0
+USE_SANDBOX=1; PAUSE=0
+while (( $# )); do
+  case "$1" in
+    --head) MODE_HEAD=1; shift ;;
+    --commit) PIN_COMMIT="${2:-}"; shift 2 || die "--commit needs a sha" ;;
+    --install) DO_INSTALL=1; shift ;;
+    --json) AS_JSON=1; shift ;;
+    --no-sandbox) USE_SANDBOX=0; shift ;;
+    --pause) PAUSE=1; shift ;;
+    -h|--help) sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; s/^#$//; /^set -uo/d'; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) [[ -z $TARGET ]] || die "unexpected argument: $1"; TARGET="$1"; shift ;;
+  esac
+done
+[[ -n $TARGET ]] || die "a git URL, plugin id, or local dir is required (see --help)"
+[[ -n $PIN_COMMIT ]] && MODE_HEAD=0
+
+finish() { (( PAUSE )) && { printf '\n%sPress Enter to close…%s' "$DIM" "$RST"; read -r _ || true; }; exit "$1"; }
+
+for t in git jq find file grep; do command -v "$t" >/dev/null || die "missing required tool: $t" 3; done
+if (( USE_SANDBOX )) && ! command -v bwrap >/dev/null; then
+  say "${YEL}bwrap not found — falling back to --no-sandbox.${RST}"; USE_SANDBOX=0
+fi
+
+# ---------------------------------------------------------------- catalog fetch
+mkdir -p "$CACHE_DIR"
+CATALOG="$CACHE_DIR/catalog.json"
+fetch_catalog() {
+  [[ -f $CATALOG ]] && (( $(date +%s) - $(stat -c %Y "$CATALOG" 2>/dev/null || echo 0) < CACHE_TTL )) && return 0
+  command -v curl >/dev/null || return 1
+  curl -fsS --max-time 30 -o "$CATALOG.tmp" "$CATALOG_URL" 2>/dev/null \
+    && jq -e . "$CATALOG.tmp" >/dev/null 2>&1 \
+    && mv "$CATALOG.tmp" "$CATALOG" || { rm -f "$CATALOG.tmp"; return 1; }
+}
+catalog_entry() {  # by repo url (normalized) OR by id; echoes one JSON object
+  [[ -f $CATALOG ]] || return 1
+  jq -e --arg key "$1" '
+    (.plugins // []) as $p
+    | ($key | ascii_downcase | sub("\\.git$";"") | sub("/$";"")) as $k
+    | ( [ $p[] | select((.repo // "" | ascii_downcase | sub("\\.git$";"") | sub("/$";"")) == $k) ]
+        + [ $p[] | select((.id // "" | ascii_downcase) == $k) ] )
+    | .[0] // empty' "$CATALOG" 2>/dev/null
+}
+
+# ------------------------------------------------------- resolve target -> repo
+REPO_URL=""; LOCAL_DIR=""; PLUGIN_ID=""; ENTRY=""
+if [[ -d $TARGET ]]; then
+  LOCAL_DIR="$(cd -- "$TARGET" && pwd -P)"           # resolve symlinked dir
+  [[ -f $LOCAL_DIR/manifest.json ]] || die "no manifest.json in $LOCAL_DIR — not a plugin folder"
+  PLUGIN_ID=$(jq -r '.id // ""' "$LOCAL_DIR/manifest.json" 2>/dev/null)
+  REPO_URL=$(git -C "$LOCAL_DIR" remote get-url origin 2>/dev/null || echo "")
+elif [[ $TARGET =~ ^[A-Za-z][A-Za-z0-9+.-]*:// || $TARGET =~ ^git@ ]]; then
+  REPO_URL="$TARGET"                                   # any URL scheme (https, file, ssh, git…)
+else
+  PLUGIN_ID="$TARGET"                                  # treat as marketplace id
+fi
+
+fetch_catalog || say "${YEL}note: could not fetch the marketplace catalog; continuing without verification metadata.${RST}"
+[[ -n ${REPO_URL:-} ]] && ENTRY=$(catalog_entry "$REPO_URL")
+[[ -z $ENTRY && -n ${PLUGIN_ID:-} ]] && ENTRY=$(catalog_entry "$PLUGIN_ID")
+if [[ -n $ENTRY && -z $REPO_URL ]]; then REPO_URL=$(jq -r '.repo // ""' <<<"$ENTRY"); fi
+[[ -n $REPO_URL || -n $LOCAL_DIR ]] || die "could not resolve '$TARGET' to a repo (not a URL, and not a known marketplace id)"
+
+# Refuse a URL that names a git transport helper (ext::, etc.) — same guard
+# `omarchy plugin add` uses. Free if present; a hard refusal on our own if not.
+if [[ -n $REPO_URL && $REPO_URL != /* ]]; then
+  if [[ -x "$OMARCHY_BIN/omarchy-git-url-check" ]]; then
+    "$OMARCHY_BIN/omarchy-git-url-check" "$REPO_URL" || die "refusing this URL" 2
+  elif [[ $REPO_URL == -* || $REPO_URL =~ ^[A-Za-z0-9][A-Za-z0-9+.-]*:: ]]; then
+    die "URL names a git option or transport helper, not a repository" 2
+  fi
+fi
+
+# --------------------------------------------------------- verification posture
+VERIFIED_COMMIT=$(jq -r '.verificationCommit // .listingValidatedCommit // ""' <<<"${ENTRY:-{}}" 2>/dev/null)
+UPSTREAM_OBSERVED=$(jq -r '.upstreamObservedCommit // ""' <<<"${ENTRY:-{}}" 2>/dev/null)
+VSTATUS=$(jq -r '.verificationSnapshotStatus // "none"' <<<"${ENTRY:-{}}" 2>/dev/null)
+VCOVER=$(jq -r '.verificationCoverage // "none"' <<<"${ENTRY:-{}}" 2>/dev/null)
+VMETHOD=$(jq -r '.verificationMethod // ""' <<<"${ENTRY:-{}}" 2>/dev/null)
+CAT_STARS=$(jq -r '.stars // ""' <<<"${ENTRY:-{}}" 2>/dev/null)
+CAT_NAME=$(jq -r '.name // ""' <<<"${ENTRY:-{}}" 2>/dev/null)
+
+# ------------------------------------------------------------------- staging
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-audit.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+CHECKOUT="$STAGE/tree"
+
+clone_hardened() {  # into $CHECKOUT
+  # symlinks off (blunts the symlink+hooks class), hooks disabled, no submodule
+  # recursion, no credential/terminal prompts.
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -oBatchMode=yes" \
+  git -c core.symlinks=false -c core.hooksPath=/dev/null -c advice.detachedHead=false \
+    clone --quiet --no-checkout -- "$1" "$CHECKOUT" 2>"$STAGE/clone.err"
+}
+
+SCAN_COMMIT=""; DEFAULT_BRANCH=""; SCAN_SUBJECT=""; META_GIT=""; IS_LOCAL=0
+if [[ -n $LOCAL_DIR ]]; then
+  # Scan the tree exactly as it sits on disk. Re-auditing an installed plugin
+  # is about the commit you are ACTUALLY running, which may be past (or behind)
+  # any verified snapshot — so we never re-clone or re-pin here. REPO_URL, when
+  # the folder has one, is used only for the catalog lookup above.
+  IS_LOCAL=1
+  mkdir -p "$CHECKOUT"
+  cp -a "$LOCAL_DIR/." "$CHECKOUT/" 2>/dev/null || die "could not copy $LOCAL_DIR into the sandbox staging dir" 3
+  if git -C "$LOCAL_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    SCAN_COMMIT=$(git -C "$LOCAL_DIR" rev-parse HEAD 2>/dev/null || echo "")
+    SCAN_SUBJECT=$(git -C "$LOCAL_DIR" log -1 --format='%s' 2>/dev/null || echo "")
+    DEFAULT_BRANCH=$(git -C "$LOCAL_DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+    META_GIT="$LOCAL_DIR"
+  fi
+  [[ -n $SCAN_COMMIT ]] || SCAN_COMMIT="(local files, not a git checkout)"
+else
+  clone_hardened "$REPO_URL" || die "git clone failed: $(tr '\n' ' ' <"$STAGE/clone.err" | cut -c1-160)" 3
+  DEFAULT_BRANCH=$(git -C "$CHECKOUT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+  DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+  if [[ -n $PIN_COMMIT ]]; then SCAN_COMMIT="$PIN_COMMIT"
+  elif (( MODE_HEAD )); then SCAN_COMMIT="origin/$DEFAULT_BRANCH"
+  elif [[ -n $VERIFIED_COMMIT ]]; then SCAN_COMMIT="$VERIFIED_COMMIT"
+  else SCAN_COMMIT="origin/$DEFAULT_BRANCH"; fi
+  git -C "$CHECKOUT" -c advice.detachedHead=false checkout --quiet "$SCAN_COMMIT" -- 2>/dev/null \
+    || git -C "$CHECKOUT" -c advice.detachedHead=false checkout --quiet "$SCAN_COMMIT" 2>/dev/null \
+    || die "could not check out $SCAN_COMMIT" 3
+  SCAN_COMMIT=$(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || echo "$SCAN_COMMIT")
+  SCAN_SUBJECT=$(git -C "$CHECKOUT" log -1 --format='%s' 2>/dev/null || echo "")
+  META_GIT="$CHECKOUT"
+fi
+
+# Now that a manifest is on disk, recover the plugin id if the target was a URL
+# (needed so --install can re-point origin and verify the installed HEAD).
+[[ -z ${PLUGIN_ID:-} && -f "$CHECKOUT/manifest.json" ]] && \
+  PLUGIN_ID=$(jq -r '.id // ""' "$CHECKOUT/manifest.json" 2>/dev/null)
+
+# commits in B not in A, when both are resolvable in META_GIT
+behind_count() { [[ -n $META_GIT ]] && git -C "$META_GIT" rev-list --count "$1..$2" 2>/dev/null || echo "?"; }
+have_commit()  { [[ -n $META_GIT ]] && git -C "$META_GIT" cat-file -e "$1" 2>/dev/null; }
+
+# ------------------------------------------------------------------- symlinks
+# core.symlinks=false turns tracked symlinks into plain files locally, so they'd
+# slip past the shell's no-symlink rule if installed from this checkout. Detect
+# them from git's index (mode 120000) so we can warn / refuse on --install.
+SYMLINKS=""
+if [[ -d $CHECKOUT/.git ]]; then
+  SYMLINKS=$(git -C "$CHECKOUT" ls-files -s 2>/dev/null | awk '$1=="120000"{print $4}')
+fi
+
+# ------------------------------------------------------------------- run scan
+RAW="$STAGE/scan.out"
+run_sandboxed() {
+  bwrap \
+    --ro-bind /usr /usr \
+    --symlink usr/lib /lib --symlink usr/lib /lib64 \
+    --symlink usr/bin /bin --symlink usr/bin /sbin \
+    --ro-bind-try /etc/alternatives /etc/alternatives \
+    --proc /proc --dev /dev \
+    --tmpfs /tmp --tmpfs /home --dir /home/audit \
+    --ro-bind "$CHECKOUT" /audit \
+    --ro-bind "$SCANNER" /scan.sh \
+    --clearenv \
+    --setenv PATH /usr/bin --setenv HOME /home/audit \
+    --setenv LANG C.UTF-8 --setenv OMARCHY_BIN "$OMARCHY_BIN" \
+    --unshare-all --die-with-parent --new-session \
+    /usr/bin/bash /scan.sh /audit
+}
+if (( USE_SANDBOX )); then
+  run_sandboxed >"$RAW" 2>"$STAGE/scan.err" || { cat "$STAGE/scan.err" >&2; die "sandboxed scan failed" 3; }
+else
+  OMARCHY_BIN="$OMARCHY_BIN" bash "$SCANNER" "$CHECKOUT" >"$RAW" 2>"$STAGE/scan.err" || { cat "$STAGE/scan.err" >&2; die "scan failed" 3; }
+fi
+
+# --------------------------------------------------------------------- tally
+n_find=$(grep -c $'^FIND\t' "$RAW" 2>/dev/null || echo 0); n_find=${n_find//[!0-9]/}; n_find=${n_find:-0}
+n_cap=$(grep -c $'^CAP\t'  "$RAW" 2>/dev/null || echo 0);  n_cap=${n_cap//[!0-9]/};  n_cap=${n_cap:-0}
+VALIDATE=$(grep $'^VALIDATE\t' "$RAW" | head -1)
+V_RES=$(cut -f2 <<<"$VALIDATE"); V_MSG=$(cut -f3 <<<"$VALIDATE")
+
+if (( n_find > 0 )); then OUTCOME="needs-fixes"; OC_COLOR=$RED; OC_EXIT=20
+elif (( n_cap > 0 )); then OUTCOME="review-required"; OC_COLOR=$YEL; OC_EXIT=10
+else OUTCOME="passed"; OC_COLOR=$GRN; OC_EXIT=0; fi
+[[ $V_RES == fail ]] && { OC_COLOR=$RED; OC_EXIT=$(( OC_EXIT<20?20:OC_EXIT )); }
+
+# =============================================================================
+# JSON output
+# =============================================================================
+if (( AS_JSON )); then
+  jq -n \
+    --arg target "$TARGET" --arg repo "$REPO_URL" --arg id "${PLUGIN_ID:-}" \
+    --arg scanned "$SCAN_COMMIT" --arg verified "$VERIFIED_COMMIT" \
+    --arg upstream "$UPSTREAM_OBSERVED" --arg vstatus "$VSTATUS" --arg vcover "$VCOVER" \
+    --arg vmethod "$VMETHOD" --arg outcome "$OUTCOME" --arg validate "$V_RES" \
+    --argjson nfind "$n_find" --argjson ncap "$n_cap" \
+    --rawfile raw "$RAW" '
+    ($raw | split("\n") | map(select(length>0) | split("\t"))) as $rows
+    | {
+      target:$target, repo:$repo, id:$id,
+      scannedCommit:$scanned, verifiedCommit:$verified, upstreamObservedCommit:$upstream,
+      marketplace:{snapshotStatus:$vstatus, coverage:$vcover, method:$vmethod},
+      outcome:$outcome, manifestValidate:$validate,
+      findingCount:$nfind, capabilityCount:$ncap,
+      findings:   [ $rows[] | select(.[0]=="FIND") | {id:.[1], at:.[2], evidence:.[3]} ],
+      capabilities:[ $rows[] | select(.[0]=="CAP")  | {id:.[1], at:.[2], evidence:.[3]} ],
+      info:       [ $rows[] | select(.[0]=="INFO") | {id:.[1], at:.[2], evidence:.[3]} ]
+    }'
+  finish "$OC_EXIT"
+fi
+
+# =============================================================================
+# Text report
+# =============================================================================
+say ""
+say "${BOLD}Omarchy plugin audit${RST}  ${DIM}(static triage — read the code yourself before trusting it)${RST}"
+say "${DIM}────────────────────────────────────────────────────────────${RST}"
+printf '%-14s %s\n' "Plugin" "${CAT_NAME:-${PLUGIN_ID:-$TARGET}}${PLUGIN_ID:+  ${DIM}[$PLUGIN_ID]${RST}}"
+[[ -n $REPO_URL ]] && printf '%-14s %s\n' "Repo" "$REPO_URL"
+[[ -n $CAT_STARS ]] && printf '%-14s %s\n' "Stars" "★ $CAT_STARS"
+printf '%-14s %s%s\n' "Scanned" "${SCAN_COMMIT:0:40}" "${SCAN_SUBJECT:+  ${DIM}\"$SCAN_SUBJECT\"${RST}}"
+(( IS_LOCAL )) && printf '%-14s %s\n' "Source" "${DIM}installed / local folder, scanned as-is${RST}"
+
+head2 "Commit posture"
+if [[ -n $VERIFIED_COMMIT ]]; then
+  vlabel="verified by the marketplace"; [[ $VMETHOD == maintainer-reviewed ]] && vlabel="maintainer-reviewed"
+  printf '  %s✔%s  verified snapshot  %s  %s\n' "$GRN" "$RST" "${VERIFIED_COMMIT:0:12}" "$DIM$vlabel$RST"
+
+  # How far the commit we actually scanned sits from the verified snapshot.
+  # This is the drift the tool exists to surface — on an installed folder the
+  # scanned commit is the one you are running, which may be past the snapshot.
+  if [[ $SCAN_COMMIT != "(local"* ]] && have_commit "$VERIFIED_COMMIT" && have_commit "$SCAN_COMMIT"; then
+    sref=$(git -C "$META_GIT" rev-parse "$SCAN_COMMIT" 2>/dev/null)
+    vref=$(git -C "$META_GIT" rev-parse "$VERIFIED_COMMIT" 2>/dev/null)
+    if [[ -n $sref && $sref == "$vref" ]]; then
+      say "  ${GRN}✔ you are scanning exactly the verified commit.${RST}"
+    else
+      ahead=$(behind_count "$VERIFIED_COMMIT" "$SCAN_COMMIT")
+      behind=$(behind_count "$SCAN_COMMIT" "$VERIFIED_COMMIT")
+      who=$( (( IS_LOCAL )) && echo "the installed code" || echo "this code" )
+      if [[ $ahead != 0 && $ahead != "?" ]]; then
+        say "  ${YEL}⚠ $who is $ahead commit(s) PAST the verified snapshot — that newer code is NOT covered by any marketplace check.${RST}"
+      elif [[ $behind != 0 && $behind != "?" ]]; then
+        say "  ${YEL}⚠ $who is $behind commit(s) BEHIND the verified snapshot.${RST}"
+      else
+        say "  ${DIM}scanned commit is off the verified snapshot's line of history.${RST}"
+      fi
+    fi
+  fi
+
+  # For a fresh clone, also say whether upstream itself has moved past verified.
+  if (( ! IS_LOCAL )) && [[ -n $DEFAULT_BRANCH ]] && git -C "$CHECKOUT" cat-file -e "$VERIFIED_COMMIT" 2>/dev/null; then
+    uahead=$(behind_count "$VERIFIED_COMMIT" "origin/$DEFAULT_BRANCH")
+    if [[ $uahead == 0 ]]; then say "  ${GRN}Upstream HEAD is the verified commit.${RST}"
+    elif [[ $uahead != "?" ]]; then say "  ${DIM}upstream HEAD is $uahead commit(s) past the verified snapshot.${RST}"; fi
+  fi
+
+  case "$VCOVER" in
+    update-unverified) say "  ${DIM}marketplace: snapshot ${VSTATUS}, but a newer upstream commit is unverified.${RST}" ;;
+    snapshot-verified) say "  ${DIM}marketplace: snapshot ${VSTATUS}; last upstream check matched the verified commit.${RST}" ;;
+  esac
+  if (( MODE_HEAD )); then say "  ${YEL}You asked for --head: scanned upstream HEAD, not the verified commit.${RST}"; fi
+else
+  say "  ${YEL}No marketplace verification on record for this plugin.${RST}"
+  say "  ${DIM}That is not a malware signal — it only means no automated snapshot check is recorded.${RST}"
+fi
+if [[ -n $UPSTREAM_OBSERVED ]]; then printf '  %slast upstream commit the marketplace saw: %s%s\n' "$DIM" "${UPSTREAM_OBSERVED:0:12}" "$RST"; fi
+
+head2 "Manifest"
+case "$V_RES" in
+  ok)   say "  ${GRN}✔${RST} passes the same schema the shell enforces before loading." ;;
+  fail) say "  ${RED}✘${RST} ${RED}$V_MSG${RST}" ;;
+  *)    say "  ${DIM}validation skipped ($V_MSG)${RST}" ;;
+esac
+
+# findings
+head2 "Findings  ${DIM}(patterns the marketplace baseline would block)${RST}"
+if (( n_find == 0 )); then
+  say "  ${GRN}none${RST}"
+else
+  while IFS=$'\t' read -r _ id at ev; do
+    printf '  %s●%s %s%-34s%s %s%s%s\n' "$RED" "$RST" "$BOLD" "$id" "$RST" "$DIM" "$at" "$RST"
+    printf '      %s\n' "$ev"
+  done < <(grep $'^FIND\t' "$RAW")
+fi
+
+# capabilities
+head2 "Capabilities  ${DIM}(worth a look; not automatically dangerous)${RST}"
+if (( n_cap == 0 )); then
+  say "  ${GRN}none${RST}"
+else
+  # collapse to one line per capability id with a count
+  while IFS=$'\t' read -r id cnt; do
+    printf '  %s◆%s %-30s %s×%s%s\n' "$YEL" "$RST" "$id" "$DIM" "$cnt" "$RST"
+  done < <(grep $'^CAP\t' "$RAW" | cut -f2 | sort | uniq -c | awk '{print $2"\t"$1}')
+fi
+
+# symlink warning
+if [[ -n $SYMLINKS ]]; then
+  head2 "Symlinks"
+  say "  ${YEL}⚠ tracked symlinks present — the shell refuses these on install:${RST}"
+  while read -r s; do [[ -n $s ]] && printf '      %s\n' "$s"; done <<<"$SYMLINKS"
+fi
+
+# informational, folded
+n_info=$(grep -c $'^INFO\t' "$RAW" 2>/dev/null || echo 0); n_info=${n_info//[!0-9]/}
+if (( ${n_info:-0} > 0 )); then
+  head2 "Context  ${DIM}(informational)${RST}"
+  while IFS=$'\t' read -r id cnt; do
+    printf '  %s· %-28s %s×%s\n' "$DIM" "$id" "$cnt" "$RST"
+  done < <(grep $'^INFO\t' "$RAW" | cut -f2 | sort | uniq -c | awk '{print $2"\t"$1}')
+fi
+
+# verdict
+say ""
+say "${DIM}────────────────────────────────────────────────────────────${RST}"
+printf '%sVerdict:%s %s%s%s  ' "$BOLD" "$RST" "$OC_COLOR$BOLD" "$OUTCOME" "$RST"
+case "$OUTCOME" in
+  passed)          say "${DIM}no blocking patterns or review capabilities found by this triage.${RST}" ;;
+  review-required) say "${DIM}capabilities above want a human read before you enable it.${RST}" ;;
+  needs-fixes)     say "${RED}findings above should be understood before you run this.${RST}" ;;
+esac
+say "${DIM}This is grep-grade triage, not a proof of safety. Read the source.${RST}"
+
+# --------------------------------------------------------------------- install
+if (( DO_INSTALL )); then
+  head2 "Install"
+  if [[ -z $REPO_URL ]]; then
+    say "  ${YEL}--install needs a git repo; this was a local folder. Skipping.${RST}"
+  elif [[ -n $SYMLINKS ]]; then
+    say "  ${RED}Refusing --install: tracked symlinks would be rejected by the shell (and are a red flag).${RST}"; OC_EXIT=$(( OC_EXIT<20?20:OC_EXIT ))
+  elif (( OC_EXIT >= 20 )); then
+    say "  ${RED}Refusing --install: audit is '${OUTCOME}'. Re-run and read the findings, or install manually if you accept them.${RST}"
+  elif ! command -v omarchy-plugin-add >/dev/null && ! command -v omarchy >/dev/null; then
+    say "  ${YEL}omarchy CLI not found; cannot install.${RST}"
+  else
+    # Give the detached checkout a branch at the audited commit so the clone
+    # `omarchy plugin add` makes from it lands on exactly this code, then point
+    # origin back at upstream so `omarchy plugin update` still works.
+    add_src="$STAGE/install-src"
+    git -c core.symlinks=false -c advice.detachedHead=false clone --quiet "$CHECKOUT" "$add_src" 2>/dev/null || cp -a "$CHECKOUT" "$add_src"
+    git -C "$add_src" -c advice.detachedHead=false checkout -B "${DEFAULT_BRANCH:-main}" "$SCAN_COMMIT" --quiet 2>/dev/null || true
+    [[ -n $REPO_URL ]] && git -C "$add_src" remote set-url origin "$REPO_URL" 2>/dev/null || true
+    say "  Installing the audited checkout (${SCAN_COMMIT:0:12}) — DISABLED, per Omarchy's review-first flow…"
+    if omarchy plugin add "$add_src" --yes; then
+      inst="$HOME/.config/omarchy/plugins/${PLUGIN_ID:-}"
+      if [[ -n $PLUGIN_ID && -d $inst/.git ]]; then
+        got=$(git -C "$inst" rev-parse HEAD 2>/dev/null)
+        if [[ $got == "$SCAN_COMMIT" ]]; then say "  ${GRN}✔ installed at the audited commit.${RST}"
+        else say "  ${YEL}⚠ installed HEAD ($got) differs from audited ($SCAN_COMMIT); inspect before enabling.${RST}"; fi
+        git -C "$inst" remote set-url origin "$REPO_URL" 2>/dev/null || true
+      fi
+      say "  ${DIM}It is installed but NOT enabled. Enable it yourself when ready:${RST}"
+      say "      ${CYN}omarchy plugin enable ${PLUGIN_ID:-<id>}${RST}"
+    else
+      say "  ${RED}omarchy plugin add failed.${RST}"; OC_EXIT=$(( OC_EXIT<3?3:OC_EXIT ))
+    fi
+  fi
+fi
+
+finish "$OC_EXIT"
