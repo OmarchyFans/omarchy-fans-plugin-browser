@@ -14,7 +14,7 @@ import qs.Ui
 // puts ~/.local/bin (where install.sh symlinks the tools) on PATH.
 BarWidget {
   id: root
-  moduleName: "kingmk3r.plugin-browser"
+  moduleName: "io.github.modpunk.plugin-browser"
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
