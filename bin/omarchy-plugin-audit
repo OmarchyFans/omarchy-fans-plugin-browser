@@ -38,6 +38,11 @@
 # Exit codes: 0 clean · 10 review-required · 20 findings · 2 usage · 3 scan error
 set -uo pipefail
 
+# Only root-owned system directories, plus Omarchy's own commands: nothing this
+# script runs (git, jq, curl, bwrap, gum, omarchy) can be shadowed by an
+# executable placed earlier on someone's PATH.
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/share/omarchy/bin"
+
 # --------------------------------------------------------------------------- ui
 if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
   BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'

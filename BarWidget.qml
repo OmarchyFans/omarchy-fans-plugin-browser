@@ -6,12 +6,12 @@ import qs.Ui
 // Bar button for the plugin browser. One click opens a terminal running
 // `omarchy-plugin-browser`, the searchable marketplace TUI. The heavy UI and
 // every install path live in that script (and in `omarchy-plugin-audit`), so
-// this widget stays a thin, side-effect-free launcher — no network, no plugin
+// this widget stays a thin, side-effect-free launcher: no network, no plugin
 // data parsed inside the long-lived shell process.
 //
-// The launch string is a fixed literal, so routing it through bar.run
-// (`bash -lc <command>`) carries no injection surface; the login shell is what
-// puts ~/.local/bin (where install.sh symlinks the tools) on PATH.
+// Nothing is looked up on PATH and no shell string is built: the terminal is an
+// absolute path, the script is this plugin's own checkout run by an absolute
+// bash, the argv is fixed, and the child gets a fixed system PATH.
 BarWidget {
   id: root
   moduleName: "io.github.modpunk.plugin-browser"
@@ -19,9 +19,25 @@ BarWidget {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  readonly property string home: Quickshell.env("HOME") || ""
+  // This file's folder as a plain path. Qt.resolvedUrl gives a file:// URL.
+  readonly property string pluginDir: {
+    var url = Qt.resolvedUrl(".").toString()
+    return decodeURIComponent(url.replace(/^file:\/\//, "")).replace(/\/$/, "")
+  }
+
   function launch() {
-    if (root.bar && typeof root.bar.run === "function")
-      root.bar.run("omarchy-launch-tui omarchy-plugin-browser")
+    Quickshell.execDetached({
+      command: [
+        "/usr/bin/xdg-terminal-exec",
+        "--app-id=io.github.modpunk.plugin-browser",
+        "--title=Plugin Browser",
+        "-e",
+        "/usr/bin/bash", root.pluginDir + "/bin/omarchy-plugin-browser"
+      ],
+      environment: { "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/share/omarchy/bin" },
+      workingDirectory: root.home
+    })
   }
 
   BarIconButton {
