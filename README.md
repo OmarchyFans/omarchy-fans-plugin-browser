@@ -32,6 +32,23 @@ ask — hands that reviewed checkout to `omarchy plugin add`.
 Requires `git jq curl file gum` and, for real isolation, `bwrap`
 (`omarchy pkg add bubblewrap`). Reverse everything with `./uninstall.sh`.
 
+### Updates
+
+About once every six hours the bar button fetches this repository's
+`manifest.json` (one small HTTPS request, no personal data). If a newer version
+is out, a dot appears on the button and the next click shows what changed, from
+`CHANGELOG.md`. *Update…* opens a terminal that runs `omarchy plugin update`
+(it shows the diff and asks), then `install.sh` (asks again). *Later* hides
+that version. Set `"update_check": false` in
+`~/.config/omarchy-plugin-browser/config.json` to turn the check off. By hand:
+
+```bash
+omarchy plugin update io.github.modpunk.plugin-browser
+~/.config/omarchy/plugins/io.github.modpunk.plugin-browser/install.sh
+```
+
+See [docs/update-alerts.md](docs/update-alerts.md) for how it is built.
+
 ## Use
 
 ```bash
